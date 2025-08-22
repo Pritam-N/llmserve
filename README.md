@@ -62,7 +62,7 @@ Single command brings the whole stack up from a YAML manifest.
 
 ## Manifest (YAML)
 
-Everything is configured in one file. Example:
+Everything is configured in one file. Example: [llmserve-dev.yaml](examples/local/llmserve-dev.yaml)]
 ```sh
 apiVersion: v1
 kind: LLMServe
@@ -79,62 +79,7 @@ spec:
       id: TinyLlama/TinyLlama-1.1B-Chat-v1.0
       enabled: true
       speculative_tokens: 8
-
-  scheduling:
-    fair_share:
-      tenants:
-        default: {weight: 1.0}
-        premium: {weight: 2.0, ttft_slo_ms: 300}
-    policies:
-      chunked_prefill: true
-      prefill_long_prompt_tokens: 1024
-      min_decode_slots: 2
-      queue_max_len: 2000
-
-  budgets:
-    max_tokens_in_flight: 250000
-    max_prefill_concurrency: 6
-    max_decode_concurrency: 12
-    max_kv_hbm_gb: 60
-    max_kv_io_gbps: 60
-
-  kv_cache:
-    page_size_kb: 512
-    prefix_caching: true
-    hbm_dtype: fp16
-    disk_dtype: int8
-    eviction:
-      hot_keep_secs: 300
-      evict_if_inactive_secs: 900
-      tenant_hotset_gb:
-        default: 8
-        premium: 24
-
-  storageClasses:
-    - name: fast-nvme
-      type: filesystem
-      path: /var/lib/kvpages
-      gds: true
-      prefetch_on_prefix: true
-    - name: object-s3
-      type: s3
-      bucket: kv-cache-prod
-      region: ap-south-1
-      prefetch_on_prefix: false
-
-  transfer:
-    engine_order: [nixl, ucx, nccl]
-    nixl: { backend_policy: auto }
-    ucx:  { rdma: true }
-    nccl: { p2p: true }
-
-  deployment:
-    mode: k8s
-    replicas: {prefill: 4, decode: 8}
-    resources: {prefill_gpu: 1, decode_gpu: 1}
-
-  security:
-    api_keys: ["env:API_KEY"]
+      ...
 ```
 
 
