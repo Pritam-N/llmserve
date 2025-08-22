@@ -1,0 +1,40 @@
+---
+config:
+  theme: mc
+  layout: dagre
+---
+flowchart BT
+ subgraph Client["Client / SDK"]
+  end
+ subgraph Router["Smart Router & Scheduler"]
+        R["Router\n- Tenant tags\n- KV locality\n- Budgets & fairness"]
+  end
+ subgraph PrefillPool["Prefill Pool (vLLM / TP, PP, Chunked Prefill)"]
+        P1["Prefill Worker 1"]
+        Pn["Prefill Worker N"]
+  end
+ subgraph KVMgr["KV Cache Manager (Paging & Tiering)"]
+        HBM["GPU HBM hot"]
+        DRAM["CPU DRAM"]
+        NVMe["NVMe / Filesystem"]
+        OBJ["Object Store - S3 / NAS"]
+  end
+ subgraph Xfer["Transfer Engine (auto)"]
+        NIXL["NIXL - RDMA / GDS"]
+        UCX["UCX RDMA"]
+        NCCL["NCCL P2P"]
+  end
+ subgraph DecodePool["Decode Pool (vLLM / Speculative, Cont. Batching)"]
+        D1["Decode Worker 1"]
+        Dn["Decode Worker N"]
+  end
+    Client -- OpenAI API --> GW["API Gateway"]
+    GW --> R
+    R -- Place prefill --> P1 & Pn
+    P1 -- KV pages --> KVMgr
+    Pn -- KV pages --> KVMgr
+    KVMgr <-- GPU↔GPU / GPU↔NVMe / NVMe↔OBJ --> Xfer
+    R -- KV locality aware\nplace decode --> D1 & Dn
+    Xfer --> D1 & Dn
+    D1 -- Stream tokens --> GW
+    Dn -- Stream tokens --> GW
