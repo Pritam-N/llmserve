@@ -53,7 +53,7 @@ Single command brings the whole stack up from a YAML manifest.
 
 
 ## How it works (high-level)
-![Alt text](flow.png "Architecture")
+![Alt text](assets/flow.png "Architecture")
 
 >	-	Prefill produces KV pages; transfer engine moves pages to the chosen decode worker and/or tiered storage.
 >	-	Router is KV-locality-aware and enforces budgets via the scheduler.
