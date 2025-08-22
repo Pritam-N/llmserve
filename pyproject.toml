@@ -1,0 +1,17 @@
+[project]
+name = "llmserve"
+version = "0.1.0"
+description = "Production-ready LLM serving with vLLM, disaggregated prefill/decode, continuous batching, tiered KV-cache (GPU → DRAM → NVMe → Object), NIXL/UCX/NCCL transfer engines, speculative decoding, and a fair-share scheduler. Single command brings the whole stack up from a YAML manifest."
+authors = [
+    {name = "pritaman",email = "nayak264@gmail.com"}
+]
+license = {text = "MIT License"}
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
