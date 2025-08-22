@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: LLMServe
+metadata: {name: dev}
+spec:
+  models:
+    primary:
+      id: mistralai/Mistral-7B-Instruct
+      dtype: bf16
+      tensor_parallel: 1
+      pipeline_parallel: 1
+  scheduling: {}
+  budgets: {}
+  kv_cache: {}
+  storageClasses: []
+  transfer: {}
+  deployment:
+    mode: local
+    replicas: {prefill: 1, decode: 1}
+  security:
+    api_keys: []
