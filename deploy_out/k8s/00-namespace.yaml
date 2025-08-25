@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: llmserve
+  labels:
+    app.kubernetes.io/name: llmserve
+    app.kubernetes.io/part-of: llmserve

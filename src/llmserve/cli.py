@@ -1,12 +1,12 @@
 from __future__ import annotations
 import asyncio
-import os
-import sys
+import os, sys, subprocess
 import typer
 from rich import print as rprint
 from . import __version__
 from .config import load_manifest
 from .runner import Orchestrator
+from .deploy.k8sgen import render_manifests, write_out
 
 app = typer.Typer(add_completion=False, help="LLMServe CLI")
 
@@ -17,19 +17,47 @@ def _global(
     if verbose:
         os.environ["LOGLEVEL"] = "DEBUG"
 
-@app.command(help="Run everything locally in one process (API + stubs).")
+@app.command(help="Run locally OR render/apply K8s manifests.")
 def up(
     manifest: str = typer.Option("llmserve.yaml", "--manifest", "-f", help="Path to manifest YAML"),
-    host: str = typer.Option("0.0.0.0", help="Bind host"),
-    port: int = typer.Option(8000, help="HTTP port"),
-    metrics_port: int = typer.Option(9400, help="Prometheus port"),
+    host: str = typer.Option("0.0.0.0", help="Bind host (local mode)"),
+    port: int = typer.Option(8000, help="HTTP port (local mode)"),
+    metrics_port: int = typer.Option(9400, help="Prometheus port (local mode)"),
+    mode: str = typer.Option("local", "--mode", help="local|k8s"),
+    namespace: str = typer.Option("llmserve", "--namespace"),
+    image: str = typer.Option(None, "--image", help="Container image (k8s mode)"),
+    svc_type: str = typer.Option("LoadBalancer", "--service-type", help="ClusterIP|NodePort|LoadBalancer"),
+    out_dir: str = typer.Option("deploy_out/k8s", "--out-dir", help="Where to write generated YAML in k8s mode"),
+    apply: bool = typer.Option(False, "--apply", help="Run `kubectl apply -f` on the out-dir"),
 ):
     spec = load_manifest(manifest)
-    orch = Orchestrator(spec)
-    try:
-        asyncio.run(orch.run_local(host=host, port=port, metrics_port=metrics_port))
-    except KeyboardInterrupt:
-        rprint("[yellow]Shutting down...[/yellow]")
+
+    if mode == "local":
+        orch = Orchestrator(spec)
+        try:
+            asyncio.run(orch.run_local(host=host, port=port, metrics_port=metrics_port))
+        except KeyboardInterrupt:
+            rprint("[yellow]Shutting down...[/yellow]")
+        return
+
+    if mode != "k8s":
+        rprint(f"[red]Unknown mode {mode}[/red]"); raise typer.Exit(1)
+
+    # Render manifests
+    docs = render_manifests(spec, namespace=namespace, image=image, replicas=None)
+    with open(manifest, "r", encoding="utf-8") as f:
+        manitext = f.read()
+    outdir = write_out(out_dir, docs, manitext)
+    rprint(f"[green]Rendered K8s manifests to[/green] {outdir}")
+
+    if apply:
+        cmd = ["kubectl", "apply", "-f", str(outdir)]
+        rprint(f"[cyan]Applying:[/cyan] {' '.join(cmd)}")
+        try:
+            subprocess.run(cmd, check=True)
+        except Exception as e:
+            rprint(f"[red]kubectl apply failed:[/red] {e}")
+            raise typer.Exit(1)
 
 @app.command(help="Validate manifest and print a deploy plan (stub).")
 def apply(

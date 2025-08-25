@@ -21,6 +21,16 @@ dependencies = [
   "vllm>=0.10",
 ]
 
+[project.optional-dependencies]
+lookahead = [
+  "lade>=0.1.4",                # LookaheadDecoding pip package
+  "transformers>=4.41",
+  "accelerate>=0.30",
+  # One of these two (faster if available):
+  # vanilla FA:
+  "flash-attn==2.3.3",
+  # OR specialized LADE FA wheel (manual install per GPU/Torch/Python matrix per README)
+]
 
 [build-system]
 requires = ["setuptools", "wheel"]

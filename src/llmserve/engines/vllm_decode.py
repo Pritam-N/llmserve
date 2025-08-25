@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
-import logging
-from typing import AsyncGenerator
+import logging, time, random
+from typing import AsyncGenerator, Protocol
+from ..metrics.prometheus import SPEC_ACCEPT, SPEC_SPEEDUP
+from ..util.plugin import load_symbol, PluginLoadError
 
 log = logging.getLogger(__name__)
 
@@ -18,76 +20,251 @@ except Exception as e:
     VLLM_AVAILABLE = False
 
 
-class DecodeEngine:
-    """
-    Wrapper for a vLLM engine configured for decode (optionally speculative).
-    Today we run monolithic generation; later we'll consume KV handles.
-    """
+class DecodeStrategy(Protocol):
+    async def generate_text(self, prompt: str, **kw) -> str: ...
+    async def stream_text(self, prompt: str, **kw) -> AsyncGenerator[str, None]: ...
+
+
+def _build_engine_args(kwargs: dict) -> EngineArgs | None:
+    if not VLLM_AVAILABLE: return None
+    while True:
+        try: return EngineArgs(**kwargs)
+        except TypeError as te:
+            msg = str(te)
+            removed = False
+            for k in list(kwargs.keys()):
+                if f"'{k}'" in msg or (k + "=") in msg:
+                    kwargs.pop(k); removed = True; break
+            if not removed: raise
+
+
+class _BaseVLLMStrategy:
     def __init__(self, spec):
         self.spec = spec
         self.engine: AsyncLLMEngine | None = None
-        self.speculative_enabled = bool(self.spec.draft and self.spec.draft.enabled)
 
-    async def startup(self):
+    async def _startup(self, extra_args: dict | None = None):
         if not VLLM_AVAILABLE:
-            log.warning("Starting DecodeEngine in STUB mode (no vLLM)")
+            log.warning("Decode strategy in STUB mode (no vLLM)")
             return
-
         m = self.spec.models["primary"]
-        args_kwargs = dict(
-            model=m.id,
-            dtype=m.dtype,
-            tensor_parallel_size=m.tensor_parallel,
-            pipeline_parallel_size=m.pipeline_parallel,
+        args_kwargs: dict = dict(
+            model=m.id, dtype=m.dtype,
+            tensor_parallel_size=m.tensor_parallel, pipeline_parallel_size=m.pipeline_parallel,
+            enable_prefix_caching=self.spec.kv_cache.prefix_caching,
+            enforce_eager=self.spec.scheduling.policies.chunked_prefill,
+            gpu_memory_utilization=0.92,
         )
+        if extra_args: args_kwargs.update(extra_args)
+        ea = _build_engine_args(args_kwargs)
+        self.engine = AsyncLLMEngine.from_engine_args(ea) if ea else None
 
-        # Best effort: vLLM supports draft model + speculative tokens on some versions
-        if self.speculative_enabled and self.spec.draft:
-            # These parameters may vary across vLLM versions; guarded by try/except
-            args_kwargs.update({
-                "speculative_model": self.spec.draft.id,
-                "num_speculative_tokens": self.spec.draft.speculative_tokens,
-            })
+    async def _telemetry_spec(self, outputs, start_ts: float):
+        """Best-effort speculative metrics (acceptance, speedup) if available + sampling."""
+        tel = self.spec.telemetry
+        if not tel.speculative_metrics_enabled: return
+        if tel.speculative_sample_rate < 1.0 and random.random() > tel.speculative_sample_rate: return
+        try:
+            o0 = outputs[0]
+            metrics = getattr(o0, "metrics", None) or {}
+            acc = metrics.get("spec_acceptance") or metrics.get("acceptance_rate")
+            if acc is not None:
+                try: SPEC_ACCEPT.observe(float(acc))
+                except Exception: pass
+            # naive speedup estimate: baseline ~ duration; if speculative tokens present, scale
+            dur = max(1e-6, time.time() - start_ts)
+            base = dur  # without baseline, we can't do better; keep 1.0
+            SPEC_SPEEDUP.observe(base/dur if dur>0 else 1.0)
+        except Exception:
+            pass
 
-        args = EngineArgs(**args_kwargs)
-        self.engine = AsyncLLMEngine.from_engine_args(args)
-        log.info("DecodeEngine ready: %s (speculative=%s)", m.id, self.speculative_enabled)
-
-    async def generate_text(
-        self,
-        prompt: str,
-        max_tokens: int = 256,
-        temperature: float = 0.7,
-        top_p: float = 0.95,
-    ) -> str:
+    async def generate_text(self, prompt: str, **kw) -> str:
         if not VLLM_AVAILABLE or self.engine is None:
-            # STUB: deterministic-ish echo for dev
             return f"(stub) {prompt[:64]} ..."
-
         sp = SamplingParams(
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
+            max_tokens=int(kw.get("max_tokens", 256)),
+            temperature=float(kw.get("temperature", 0.7)),
+            top_p=float(kw.get("top_p", 0.95)),
         )
-        # AsyncLLMEngine.generate returns List[RequestOutput]
-        outputs = await self.engine.generate(prompt, sp)
-        if not outputs:
-            return ""
-        return outputs[0].outputs[0].text
+        t0 = time.time()
+        outs = await self.engine.generate(prompt, sp)
+        await self._telemetry_spec(outs, t0)
+        if not outs: return ""
+        return outs[0].outputs[0].text
 
-    async def stream_text(
-        self,
-        prompt: str,
-        max_tokens: int = 256,
-        temperature: float = 0.7,
-        top_p: float = 0.95,
-    ) -> AsyncGenerator[str, None]:
-        """
-        Simple streaming by polling incremental outputs. vLLM has streaming support,
-        but we keep a minimal, version-tolerant approach here.
-        """
-        text = await self.generate_text(prompt, max_tokens=max_tokens, temperature=temperature, top_p=top_p)
-        # naive chunking to simulate streaming
-        chunk = 64
+    async def stream_text(self, prompt: str, **kw) -> AsyncGenerator[str, None]:
+        text = await self.generate_text(prompt, **kw)
+        chunk = int(kw.get("stream_chunk", 64))
         for i in range(0, len(text), chunk):
             yield text[i:i+chunk]
+
+
+class BaselineStrategy(_BaseVLLMStrategy):
+    async def startup(self): await self._startup()
+
+
+class SpeculativeStrategy(_BaseVLLMStrategy):
+    async def startup(self):
+        sd = self.spec.spec_decode
+        extras: dict = {}
+        if sd.enabled and sd.method == "draft":
+            extras["speculative_model"] = sd.draft_model
+            extras["num_speculative_tokens"] = int(sd.num_spec_tokens)
+        elif sd.enabled and sd.method in {"eagle", "eagle2", "medusa", "arctic"}:
+            extras["speculative_algorithm"] = sd.method
+            extras["num_speculative_tokens"] = int(sd.num_spec_tokens)
+        try:
+            await self._startup(extra_args=extras)
+        except Exception as e:
+            fb = sd.fallback
+            log.warning("Speculative startup failed (%s). Fallback=%s", e, fb)
+            if fb == "draft" and sd.draft_model:
+                await self._startup(extra_args={
+                    "speculative_model": sd.draft_model,
+                    "num_speculative_tokens": int(sd.num_spec_tokens),
+                })
+            elif fb == "baseline":
+                await self._startup(extra_args={})
+            else:
+                await self._startup(extra_args={})  # disable
+
+
+class LookaheadStrategy(_BaseVLLMStrategy):
+    def __init__(self, spec):
+        super().__init__(spec)
+        self.provider = None
+        self.active = False
+
+    async def startup(self):
+        await self._startup()
+        la = self.spec.lookahead
+        if not la.enabled:
+            log.info("Lookahead disabled; baseline behavior")
+            return
+        if not la.plugin:
+            log.warning("Lookahead enabled but no plugin specified; fallback=%s", la.fallback)
+            self._fallback()
+            return
+        try:
+            Provider = load_symbol(la.plugin, "LookaheadProvider")
+            self.provider = Provider(self.spec)  # plugin-defined ctor
+            # attach may receive the low-level engine if needed
+            if self.engine is not None and hasattr(self.provider, "attach"):
+                self.provider.attach(self.engine)
+            self.active = True
+            log.info("Lookahead plugin %s loaded", la.plugin)
+        except PluginLoadError as e:
+            log.warning("Lookahead plugin load failed: %s; fallback=%s", e, la.fallback)
+            self._fallback()
+
+    def _fallback(self):
+        # nothing else to do here: we keep engine ready; methods fall back to baseline
+        self.active = False
+
+    async def generate_text(self, prompt: str, **kw) -> str:
+        if self.active and hasattr(self.provider, "generate_text"):
+            return await self.provider.generate_text(prompt, **kw)
+        return await super().generate_text(prompt, **kw)
+
+    async def stream_text(self, prompt: str, **kw) -> AsyncGenerator[str, None]:
+        if self.active and hasattr(self.provider, "stream_text"):
+            async for ch in self.provider.stream_text(prompt, **kw):
+                yield ch
+            return
+        async for ch in super().stream_text(prompt, **kw):
+            yield ch
+
+# add alongside existing strategies
+class HybridStrategy(_BaseVLLMStrategy):
+    """
+    Auto-select per-request:
+      - default to vLLM baseline/speculative (fast path)
+      - only use lookahead provider if: plugin loaded AND policy allows AND request hints
+      - otherwise, fallback to vLLM
+    """
+    def __init__(self, spec):
+        super().__init__(spec)
+        self.vllm_baseline = BaselineStrategy(spec)
+        self.vllm_spec = SpeculativeStrategy(spec)
+        self.la = LookaheadStrategy(spec)
+
+    async def startup(self):
+        # Always prepare vLLM paths first (fast path)
+        await self.vllm_baseline.startup()
+        await self.vllm_spec.startup()
+        # Prepare lookahead plugin too (may end up inactive)
+        await self.la.startup()
+
+    def _should_use_lookahead(self, tenant: str, max_tokens: int, strategy_hint: str, workload: str) -> bool:
+        s = self.spec
+        if s.decode_strategy != "hybrid": 
+            return False
+        if not (s.hybrid.enabled and s.lookahead.enabled and self.la.active):
+            return False
+        # honor explicit hint
+        if strategy_hint == "lookahead": 
+            return True
+        if strategy_hint == "baseline" or strategy_hint == "speculative":
+            return False
+        # policy checks
+        if s.hybrid.tenants and tenant not in s.hybrid.tenants:
+            return False
+        if max_tokens < s.hybrid.min_decode_tokens:
+            return False
+        # workload heuristic — prefer lookahead for code/math if caller hints it
+        if workload in {"code", "math"}:
+            return True
+        # prefer vLLM unless policy overrides
+        return not s.hybrid.prefer_vllm
+
+    async def generate_text(self, prompt: str, **kw) -> str:
+        tenant = kw.get("tenant", "default")
+        max_tokens = int(kw.get("max_tokens", 256))
+        strategy_hint = (kw.get("strategy_hint") or "auto").lower()
+        workload = (kw.get("workload") or "general").lower()
+
+        if self._should_use_lookahead(tenant, max_tokens, strategy_hint, workload):
+            return await self.la.generate_text(prompt, **kw)
+
+        # choose between baseline vs speculative (based on spec_decode.enabled)
+        if self.spec.spec_decode.enabled:
+            return await self.vllm_spec.generate_text(prompt, **kw)
+        return await self.vllm_baseline.generate_text(prompt, **kw)
+
+    async def stream_text(self, prompt: str, **kw) -> AsyncGenerator[str, None]:
+        tenant = kw.get("tenant", "default")
+        max_tokens = int(kw.get("max_tokens", 256))
+        strategy_hint = (kw.get("strategy_hint") or "auto").lower()
+        workload = (kw.get("workload") or "general").lower()
+
+        if self._should_use_lookahead(tenant, max_tokens, strategy_hint, workload):
+            async for c in self.la.stream_text(prompt, **kw): yield c; return
+
+        if self.spec.spec_decode.enabled:
+            async for c in self.vllm_spec.stream_text(prompt, **kw): yield c; return
+        async for c in self.vllm_baseline.stream_text(prompt, **kw): yield c
+
+class DecodeEngine:
+    def __init__(self, spec):
+        self.spec = spec
+        self.strategy: DecodeStrategy | None = None
+
+    async def startup(self):
+        mode = (self.spec.decode_strategy or "baseline").lower()
+        if mode == "speculative" or (self.spec.spec_decode.enabled and mode == "baseline"):
+            self.strategy = SpeculativeStrategy(self.spec)
+        elif mode == "lookahead":
+            self.strategy = LookaheadStrategy(self.spec)
+        elif mode == "hybrid":
+            self.strategy = HybridStrategy(self.spec)
+        else:
+            self.strategy = BaselineStrategy(self.spec)
+        await self.strategy.startup()  # type: ignore[attr-defined]
+        log.info("DecodeEngine strategy=%s", self.strategy.__class__.__name__)
+
+    async def generate_text(self, prompt: str, **kw) -> str:
+        return await self.strategy.generate_text(prompt, **kw)  # type: ignore
+
+    async def stream_text(self, prompt: str, **kw) -> AsyncGenerator[str, None]:
+        async for c in self.strategy.stream_text(prompt, **kw):  # type: ignore
+            yield c

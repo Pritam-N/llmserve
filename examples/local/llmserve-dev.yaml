@@ -1,6 +1,6 @@
 apiVersion: v1
 kind: LLMServe
-metadata: {name: prod}
+metadata: {name: dev}
 spec:
   models:
     primary:
@@ -9,10 +9,30 @@ spec:
       max_model_len: 32768
       tensor_parallel: 2
       pipeline_parallel: 1
-    draft:
-      id: TinyLlama/TinyLlama-1.1B-Chat-v1.0
-      enabled: true
-      speculative_tokens: 8
+
+  # speculative decoding controls
+  spec_decode:
+    enabled: true
+    method: draft             # draft | eagle | eagle2 | medusa | arctic
+    num_spec_tokens: 8
+    draft_model: TinyLlama/TinyLlama-1.1B-Chat-v1.0  # required if method=draft
+
+  # top-level decode strategy selector
+  decode_strategy: hybrid    # baseline | speculative | lookahead | hybrid
+
+  hybrid:
+    enabled: true
+    min_decode_tokens: 512
+    tenants: []           # allow all
+    prefer_vllm: true
+    fallback: baseline
+
+  lookahead:
+    enabled: false
+    ngram: 4
+    max_parallel: 8
+    plugin: llmserve_ext_lookahead
+    fallback: baseline
 
   scheduling:
     fair_share:
@@ -21,9 +41,20 @@ spec:
         premium: {weight: 2.0, ttft_slo_ms: 300}
     policies:
       chunked_prefill: true
+      prefill_chunk_tokens: 512
       prefill_long_prompt_tokens: 1024
       min_decode_slots: 2
       queue_max_len: 2000
+      prefix_awareness: true
+      aging_seconds: 2.0
+
+  rate_limit:
+    default:
+        mode: penalize          # penalize | block | reject
+        tokens_per_sec: 5000
+        burst: 20000
+        max_concurrency: 16
+        penalty_max: 3.0        # up to 3× lower priority when
 
   budgets:
     max_tokens_in_flight: 250000
@@ -69,3 +100,4 @@ spec:
 
   security:
     api_keys: ["env:API_KEY"]
+

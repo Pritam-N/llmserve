@@ -5,7 +5,7 @@ import logging
 import uvicorn
 from prometheus_client import start_http_server
 from .apiserver.http import build_app
-from .engines.vllm_prefill import PrefillEngine
+from .engines.vllm_prefil import PrefillEngine
 from .engines.vllm_decode import DecodeEngine
 from .router.router import Router
 
@@ -47,9 +47,20 @@ class Orchestrator:
 
         # router
         self.router = Router(self.spec, self.prefill_pool, self.decode_pool)
+        await self.router.start()
 
         # FastAPI
         app = build_app(self.spec, self.router)
         config = uvicorn.Config(app=app, host=host, port=port, workers=1, loop="asyncio", lifespan="on")
         server = uvicorn.Server(config)
         await server.serve()
+
+    async def stop(self):
+        if self.router:
+            await self.router.stop()
+        if self.prefill_pool:
+            for eng in self.prefill_pool:
+                await eng.shutdown()
+        if self.decode_pool:
+            for eng in self.decode_pool:
+                await eng.shutdown()
