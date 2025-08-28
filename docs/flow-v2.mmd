@@ -1,0 +1,117 @@
+---
+config:
+  layout: elk
+  theme: redux
+---
+flowchart TB
+ subgraph IngressAPI["Ingress & API"]
+        GW(("Gateway / OpenAI API"))
+        C["Client"]
+        R["Router"]
+  end
+ subgraph Router["Router"]
+        RL["Rate Limiter(penalize / block / reject)"]
+        FS["Fair-Share Scheduler<br>WFQ + SRPT bias + aging<br>prefix-aware scoring"]
+        D{"Disaggregated?"}
+  end
+ subgraph Local["Local (monolith)"]
+        DEC_LOC["DecodeEngine<br>(vLLM in-process)"]
+        LPATH["Local path"]
+        STREAM[("Streaming tokens")]
+  end
+ subgraph PDgRPC["Custom PD (gRPC)"]
+        PF["prefill-svc"]
+        RPC["Router ↔ gRPC"]
+        KVP["KV pages"]
+        DE["decode-svc"]
+  end
+ subgraph PDvLLM["vLLM PD (native)"]
+        VDEC["vLLM Decode"]
+        VHTTP["Router → vLLM Proxy/Decode (HTTP SSE)"]
+  end
+ subgraph KV["KV Cache Manager"]
+        KVH["HBM tier"]
+        KVM["Manager"]
+        KVR["DRAM tier"]
+        KVN["NVMe tier"]
+        KVO["Object tier"]
+  end
+ subgraph Xfer["Transfer Engines (ordered fallback)"]
+        DISK["Disk handle"]
+        NCCL["NCCL"]
+        UCX["UCX"]
+        NIXL["NIXL"]
+  end
+ subgraph DecodeFX["Decode Enhancements"]
+        SPEC["Speculative Decoding<br>(draft model; acceptance metrics)"]
+        LOOK["Lookahead Plugin<br>(ngram verify; max_parallel)"]
+  end
+ subgraph Obs["Observability"]
+        PROM[("Prometheus Exporter :9400")]
+  end
+ subgraph K8sObjs["K8s Objects & Networking"]
+        CM["ConfigMap: llmserve.yaml"]
+        NS["Namespace"]
+        PVC["PVC: kvpages"]
+        SC["StorageClass: fast-nvme"]
+        SVCR["Service: router"]
+        DPR["Deployment: router"]
+        SVCP["Service: prefill"]
+        DPP["Deployment: prefill"]
+        SVCD["Service: decode"]
+        DPD["Deployment: decode"]
+        NAD["NetworkAttachmentDefinitions (Multus)"]
+        RDMA[("RDMA resources")]
+  end
+ subgraph K8s["Kubernetes Cluster"]
+        IngressAPI
+        Router
+        Local
+        P{"Provider"}
+        PDgRPC
+        PDvLLM
+        KV
+        Xfer
+        DecodeFX
+        Obs
+        K8sObjs
+  end
+    C --> GW
+    GW --> R
+    R --> RL
+    RL --> FS
+    FS --> D
+    D -- No --> LPATH
+    LPATH --> DEC_LOC
+    DEC_LOC --> STREAM & SPEC
+    D -- Yes --> P
+    P -- custom --> RPC
+    P -- vLLM --> VHTTP
+    RPC --> PF & DE
+    PF --> KVP
+    DE --> STREAM & SPEC
+    VHTTP --> VDEC
+    VDEC --> STREAM & SPEC
+    KVP --> KVH & NIXL
+    KVH --> KVM
+    KVM --> KVR & KVN & KVO
+    KVM -. prefix reuse .- KVH
+    NIXL --> UCX & KVM
+    UCX --> NCCL & KVM
+    NCCL --> DISK & KVM
+    DISK --> KVM
+    SPEC --> LOOK
+    R -. "TTFT / requests / rate-limit" .-> PROM
+    FS -. queue depths .-> PROM
+    DEC_LOC -. TTFT / TPS / stream .-> PROM
+    DE -. TTFT / TPS / stream .-> PROM
+    VDEC -. TTFT / TPS / stream .-> PROM
+    VHTTP -. vLLM PD errors / tokens .-> PROM
+    NS --- CM
+    SC --- PVC
+    DPR --- SVCR
+    DPP --- SVCP
+    DPD --- SVCD
+    PVC --- DPP & DPD
+    NAD --- DPP & DPD
+    RDMA --- DPP & DPD
