@@ -8,6 +8,7 @@ from .apiserver.http import build_app
 from .engines.vllm_prefil import PrefillEngine
 from .engines.vllm_decode import DecodeEngine
 from .router.router import Router
+from .rpc.servers import serve_prefill, serve_decode
 
 log = logging.getLogger("llmserve")
 
@@ -64,3 +65,21 @@ class Orchestrator:
         if self.decode_pool:
             for eng in self.decode_pool:
                 await eng.shutdown()
+
+    async def run_router(self, host="0.0.0.0", port=None, metrics_port=9400):
+        start_http_server(metrics_port)
+        # Router uses remote callbacks; no local engines needed
+        self.router = Router(self.spec, [], [])
+        await self.router.start()
+        app = build_app(self.spec, self.router)
+        port = port or self.spec.deployment.router_port
+        config = uvicorn.Config(app=app, host=host, port=port, workers=1, loop="asyncio", lifespan="on")
+        await uvicorn.Server(config).serve()
+
+    async def run_prefill_worker(self, host="0.0.0.0", port=None, metrics_port=9400):
+        start_http_server(metrics_port)
+        await serve_prefill(self.spec, host, port or self.spec.deployment.prefill_port)
+
+    async def run_decode_worker(self, host="0.0.0.0", port=None, metrics_port=9400):
+        start_http_server(metrics_port)
+        await serve_decode(self.spec, host, port or self.spec.deployment.decode_port)

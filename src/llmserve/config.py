@@ -118,12 +118,16 @@ class TransferCfg(BaseModel):
 
 class DeployCfg(BaseModel):
     mode: str = "local"  # local|k8s
+    disaggregated: bool = False
     replicas: dict[str, int] = Field(
-        default_factory=lambda: {"prefill": 1, "decode": 1}
+        default_factory=lambda: {"router": 1, "prefill": 1, "decode": 1}
     )
     resources: dict[str, int] = Field(
         default_factory=lambda: {"prefill_gpu": 1, "decode_gpu": 1}
     )
+    router_port: int = 8000
+    prefill_port: int = 9001
+    decode_port: int = 9002
 
 
 class SecurityCfg(BaseModel):
@@ -176,6 +180,29 @@ class TelemetryCfg(BaseModel):
     # to reduce cost on very high QPS installs
     speculative_sample_rate: float = 1.0  # 0.0..1.0
 
+class RoleParallelismCfg(BaseModel):
+    tp: int = 1  # tensor-parallel GPUs per pod
+    pp: int = 1  # pipeline-parallel stages per pod
+    dp: int = 1  # pods (K8s replicas) for data-parallel scaling
+
+    shards_across_nodes: bool = (
+        False  # shard a single model across nodes (not enabled yet)
+    )
+    init_method: str | None = (
+        None  # e.g., "tcp://llmserve-rdzv:29500" for torch.distributed rendezvous
+    )
+
+class RolesCfg(BaseModel):
+    prefill: RoleParallelismCfg = RoleParallelismCfg()
+    decode: RoleParallelismCfg = RoleParallelismCfg()
+
+
+class RPCCfg(BaseModel):
+    scheme: Literal["grpc"] = "grpc"
+    prefill_service: str = "llmserve-prefill:9001"  # K8s service DNS:port
+    decode_service: str = "llmserve-decode:9002"
+    timeout_s: float = 30.0
+    round_robin: bool = True  # client-side LB; fine with ClusterIP too
 
 # =========================
 # Top-level Spec
@@ -211,6 +238,9 @@ class SpecCfg(BaseModel):
 
     # telemetry/tuning
     telemetry: TelemetryCfg = TelemetryCfg()
+
+    roles: RolesCfg = RolesCfg()      # <— NEW
+    rpc: RPCCfg = RPCCfg()
 
     @model_validator(mode="after")
     def _validate_spec(self):
@@ -251,3 +281,4 @@ def load_manifest(path: str | Path) -> SpecCfg:
     if "primary" not in m.spec.models:
         raise SystemExit("spec.models.primary is required")
     return m.spec
+

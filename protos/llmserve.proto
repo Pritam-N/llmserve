@@ -1,0 +1,39 @@
+syntax = "proto3";
+package llmserve.v1;
+
+service PrefillService {
+  rpc PrefillChunk (PrefillChunkRequest) returns (PrefillChunkReply);
+}
+
+service DecodeService {
+  rpc DecodeStream (DecodeRequest) returns (stream DecodeChunk);
+}
+
+message PrefillChunkRequest {
+  string req_id = 1;
+  string prompt = 2;
+  int32 start_token = 3;
+  int32 n_tokens = 4;
+  string tenant = 5;
+}
+
+message PrefillChunkReply {
+  bool ok = 1;
+  int32 prompt_tokens = 2;
+  string kv_handle = 3;  // reserved for future KV handoff
+}
+
+message DecodeRequest {
+  string req_id = 1;
+  string prompt = 2;
+  string tenant = 3;
+  int32 max_tokens = 4;
+  float temperature = 5;
+  float top_p = 6;
+  string strategy_hint = 7;
+  string workload = 8;
+}
+
+message DecodeChunk {
+  string delta = 1;
+}

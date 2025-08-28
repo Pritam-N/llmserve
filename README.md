@@ -92,6 +92,28 @@ llmserve apply -f llmserve.yaml           # validate manifest, print plan
 llmserve status                           # quick cluster status (stub)
 llmserve bench --mix long:30 short:70     # local synthetic generator (stub)
 ```
+## How to run in k8s:
+- Generate gRPC stubs (once per change of .proto)
+```
+llmserve gen-proto
+```
+- Build and push image
+```
+docker build -t ghcr.io/yourorg/llmserve:0.1.0 .
+docker push ghcr.io/yourorg/llmserve:0.1.0
+```
+- Set disaggregated in your manifest:
+```
+# spec:
+#   deployment:
+#     mode: k8s
+#     disaggregated: true
+#     replicas: { router: 1, prefill: 2, decode: 4 }
+```
+- Render + apply
+```
+llmserve up -f llmserve.yaml --mode k8s --namespace llmserve --image ghcr.io/yourorg/llmserve:0.1.0 --apply
+```
 
 ## Repository structure
 

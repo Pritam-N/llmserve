@@ -7,6 +7,7 @@ from ..engines.vllm_decode import DecodeEngine
 from ..scheduler.fairshare import FairShareScheduler
 from ..util.prefix_awarness import PrefixHeuristic
 from ..util.ratelimit import RateLimiter, RateLimitError, RateLimitRetry
+from ..rpc.client import RPCClient
 
 log = logging.getLogger(__name__)
 
@@ -78,3 +79,26 @@ class Router:
         out = []
         async for d in self.submit_and_stream(prompt, tenant=tenant, opts=opts or {}): out.append(d)
         return "".join(out)
+    
+class _RemoteCallbacks:
+    def __init__(self, spec):
+        self.spec = spec
+        self.rpc = RPCClient(spec)
+
+    async def prefill_chunk(self, ctx, start_token: int, n_tokens: int):
+        try:
+            await self.rpc.prefill_chunk(ctx.req_id, ctx.prompt, start_token, n_tokens, ctx.tenant)
+        except Exception as e:
+            log.warning("prefill_chunk gRPC failed: %s", e)
+            await asyncio.sleep(0)
+
+    async def decode_stream(self, ctx):
+        try:
+            stream = await self.rpc.decode_stream(ctx.req_id, ctx.prompt, ctx.tenant, ctx.opts or {})
+            async for msg in stream:
+                # msg is DecodeChunk(delta=str)
+                yield msg.delta
+        except Exception as e:
+            log.warning("decode_stream gRPC failed: %s", e)
+            # fail fast with empty stream
+            return

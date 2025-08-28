@@ -3,10 +3,11 @@ import asyncio
 import os, sys, subprocess
 import typer
 from rich import print as rprint
+from grpc_tools import protoc
 from . import __version__
 from .config import load_manifest
 from .runner import Orchestrator
-from .deploy.k8sgen import render_manifests, write_out
+from .deploy.k8sgen import render_all, write_out
 
 app = typer.Typer(add_completion=False, help="LLMServe CLI")
 
@@ -32,19 +33,30 @@ def up(
 ):
     spec = load_manifest(manifest)
 
-    if mode == "local":
-        orch = Orchestrator(spec)
-        try:
+    role = os.environ.get("ROLE", "").lower()
+    orch = Orchestrator(spec)
+
+    if mode == "local" and not role:
+        if spec.deployment.disaggregated:
+            # run router only in local disaggregated mode for now
+            asyncio.run(orch.run_router(host=host, port=spec.deployment.router_port, metrics_port=metrics_port))
+        else:
             asyncio.run(orch.run_local(host=host, port=port, metrics_port=metrics_port))
-        except KeyboardInterrupt:
-            rprint("[yellow]Shutting down...[/yellow]")
         return
+
+    if role == "router":
+        asyncio.run(orch.run_router(host=host, port=spec.deployment.router_port, metrics_port=metrics_port)); return
+    if role == "prefill":
+        asyncio.run(orch.run_prefill_worker(host=host, port=spec.deployment.prefill_port, metrics_port=metrics_port)); return
+    if role == "decode":
+        asyncio.run(orch.run_decode_worker(host=host, port=spec.deployment.decode_port, metrics_port=metrics_port)); return
+
 
     if mode != "k8s":
         rprint(f"[red]Unknown mode {mode}[/red]"); raise typer.Exit(1)
 
     # Render manifests
-    docs = render_manifests(spec, namespace=namespace, image=image, replicas=None)
+    docs = render_all(spec, namespace=namespace, image=image, svc_type=svc_type)
     with open(manifest, "r", encoding="utf-8") as f:
         manitext = f.read()
     outdir = write_out(out_dir, docs, manitext)
@@ -74,6 +86,19 @@ def status():
 @app.command(help="Show CLI/package version.")
 def version():
     rprint(f"llmserve {__version__}")
+
+@app.command(help="Generate gRPC stubs from protos/ into src/")
+def gen_proto():
+    code = protoc.main([
+        "protoc",
+        "-I", "protos",
+        "--python_out=src",
+        "--grpc_python_out=src",
+        "protos/llmserve.proto",
+    ])
+    if code != 0:
+        raise typer.Exit(code)
+    rprint("[green]Generated gRPC stubs under src/llmserve/*pb2*.py[/green]")
 
 if __name__ == "__main__":
     app()

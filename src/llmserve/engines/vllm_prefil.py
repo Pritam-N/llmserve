@@ -2,6 +2,7 @@
 from __future__ import annotations
 import logging
 from dataclasses import dataclass
+from ._helpers import resolve_tp_pp
 
 log = logging.getLogger(__name__)
 
@@ -31,8 +32,9 @@ class PrefillEngine:
     NOTE: vLLM does not yet expose a stable public API to export KV for
     cross-process decode. We call this first to keep the architecture shape.
     """
-    def __init__(self, spec):
+    def __init__(self, spec, role: str = "prefill"):
         self.spec = spec
+        self.role = role
         self.engine: AsyncLLMEngine | None = None
 
     async def startup(self):
@@ -41,15 +43,20 @@ class PrefillEngine:
             return
 
         m = self.spec.models["primary"]
-        args = EngineArgs(
+        tp, pp = resolve_tp_pp(self.spec, self.role)
+
+        args = dict(
             model=m.id,
             dtype=m.dtype,
-            tensor_parallel_size=m.tensor_parallel,
-            pipeline_parallel_size=m.pipeline_parallel,
-            # this improves fairness for long prompts
-            enable_chunked_prefill=self.spec.scheduling.policies.chunked_prefill,
+            tensor_parallel_size=tp,
+            pipeline_parallel_size=pp,
+            enable_prefix_caching=self.spec.kv_cache.prefix_caching,
+            enforce_eager=True,  # prefill benefits from eager kernels
+            gpu_memory_utilization=0.92,
         )
-        self.engine = AsyncLLMEngine.from_engine_args(args)
+        
+        ea = EngineArgs(**args)
+        self.engine = AsyncLLMEngine.from_engine_args(ea)
         log.info("PrefillEngine ready: %s", m.id)
 
     async def prefill(self, prompt: str) -> PrefillResult:

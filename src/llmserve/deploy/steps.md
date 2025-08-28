@@ -46,3 +46,5 @@ In llmserve.yaml:
 In k8sgen.py (or via flags):
 	•	--service-type → ClusterIP for internal ingress, LoadBalancer for public.
 	•	Resource requests/limits (CPU/mem/GPU).
+
+
