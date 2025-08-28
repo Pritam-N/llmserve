@@ -4,9 +4,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import AsyncGenerator
 
-import httpx  # streaming client for vLLM PD proxy/decode
+import httpx  # CHANGED: used to stream from vLLM PD proxy/decode
 
 from ..engines.vllm_prefil import PrefillEngine
 from ..engines.vllm_decode import DecodeEngine
@@ -15,7 +16,34 @@ from ..util.prefix_awarness import PrefixHeuristic
 from ..util.ratelimit import RateLimiter, RateLimitError
 from ..rpc.client import RPCClient
 
+# CHANGED: import existing + new metrics
+from ..metrics.prometheus import (
+    METRIC_TTFT,
+    METRIC_TPS,
+    Q_PREFILL,
+    Q_DECODE,
+    SPEC_ACCEPT,
+    SPEC_SPEEDUP,
+    RATE_LIMIT_REJECTS,
+    RATE_LIMIT_RETRY,
+)
+from ..metrics.prometheus import (  # NEW
+    BACKEND_TTFT,
+    REQUESTS_ACCEPTED,
+    STREAM_EVENTS,
+    STREAM_BYTES,
+    STREAM_TOKENS,
+    STREAM_ERRORS,
+    VLLM_PD_STREAM_ERRORS,
+    VLLM_PD_TOKENS_STREAMED,
+)
+
 log = logging.getLogger(__name__)
+
+
+def _estimate_tokens(text: str) -> int:
+    """Rough router-side estimator to avoid tokenizer deps."""
+    return max(1, len(text) // 4)
 
 
 # =========================
@@ -102,7 +130,6 @@ class _VLLMDisaggCallbacks:
         self.auth_header = getattr(base, "auth_header", None)
         self._client = httpx.AsyncClient(timeout=30.0)
 
-        # Cache model id for payloads
         try:
             self._model_id = self.spec.models["primary"].id
         except Exception:
@@ -129,10 +156,10 @@ class _VLLMDisaggCallbacks:
             "messages": [{"role": "user", "content": ctx.prompt}],
             "stream": True,
         }
-
-        # Optional sampling overrides
         if ctx.opts:
-            for k in ("temperature", "top_p", "max_tokens", "stop", "presence_penalty", "frequency_penalty"):
+            # Sampling overrides if present
+            for k in ("temperature", "top_p", "max_tokens", "stop",
+                      "presence_penalty", "frequency_penalty"):
                 if k in ctx.opts:
                     payload[k] = ctx.opts[k]
 
@@ -148,39 +175,41 @@ class _VLLMDisaggCallbacks:
                     if line == "[DONE]":
                         break
 
-                    # Try to parse OpenAI-style delta
+                    # Parse OpenAI-style JSON delta; fall back to raw text line
                     try:
                         obj = json.loads(line)
                     except Exception:
-                        # As a last resort treat line as raw text
                         yield line
                         continue
 
-                    # Chat delta path
                     if isinstance(obj, dict) and "choices" in obj and obj["choices"]:
                         ch0 = obj["choices"][0]
-                        # Newer OpenAI-style streaming: delta.content
                         delta = ch0.get("delta") or {}
                         content = delta.get("content")
                         if content:
                             yield content
                             continue
-                        # Some servers send 'text' instead
                         text = ch0.get("text")
                         if text:
                             yield text
                             continue
-                        # If neither exists, keep looping (tool-calls, etc.)
+                        # Else: tool-calls/finish-reasons; ignore
                         continue
 
-                    # Fallback keys sometimes used by demos
+                    # Fallback non-standard shape
                     if "output" in obj and isinstance(obj["output"], str):
                         yield obj["output"]
         except httpx.HTTPError as e:
             log.warning("vLLM PD HTTP error: %s", e)
+            # CHANGED: error metrics (both backend-generic and vLLM-specific)
+            VLLM_PD_STREAM_ERRORS.labels(reason="http").inc()
+            STREAM_ERRORS.labels(backend="vllm", reason="http").inc()
             return
         except Exception as e:
             log.warning("vLLM PD stream failed: %s", e)
+            # CHANGED: error metrics (both backend-generic and vLLM-specific)
+            VLLM_PD_STREAM_ERRORS.labels(reason="other").inc()
+            STREAM_ERRORS.labels(backend="vllm", reason="other").inc()
             return
 
 
@@ -202,18 +231,21 @@ class Router:
         self.rate = RateLimiter(spec)
         self.scheduler = FairShareScheduler(spec, self.rate)
 
-        # Choose callback backend:
+        # CHANGED: choose backend + set a label for metrics
         disagg = bool(getattr(getattr(spec, "deployment", object()), "disaggregated", False))
         provider = getattr(getattr(spec, "disagg", object()), "provider", "custom") if disagg else None
 
         if disagg and provider == "vllm":
             self._cb = _VLLMDisaggCallbacks(spec)
+            self._backend_label = "vllm"
             log.info("Router using vLLM PD backend (base=%s)", self._cb.base)
         elif disagg:
             self._cb = _RemoteCallbacks(spec)  # our custom gRPC PD
+            self._backend_label = "grpc"
             log.info("Router using CUSTOM gRPC PD backend")
         else:
             self._cb = _RouterCallbacks(decode_pool)  # local
+            self._backend_label = "local"
             log.info("Router using LOCAL backend (monolith)")
 
         self._task: asyncio.Task | None = None
@@ -237,12 +269,20 @@ class Router:
         # Rate-limit assessment (penalize or reject-at-submit depending on policy)
         assess = self.rate.assess(tenant, est_tokens)
         if assess.policy == "reject" and assess.tokens_deficit > 0:
-            from ..metrics.prometheus import RATE_LIMIT_REJECTS
-
             RATE_LIMIT_REJECTS.labels(tenant=tenant, reason="tokens@submit").inc()
             raise RateLimitError(tenant, "tokens")
 
-        # Hand to scheduler (which will call callbacks and stream deltas into ctx.out_q)
+        # CHANGED: record an accepted request (after passing RL gate)
+        REQUESTS_ACCEPTED.labels(backend=self._backend_label, tenant=tenant).inc()
+
+        # Submit to scheduler (it will call callbacks and push chunks into ctx.out_q)
+        t_submit = time.monotonic()
+        first_seen = False
+
+        # For streaming aggregates
+        total_tokens = 0
+        total_bytes = 0
+
         ctx = await self.scheduler.submit(
             tenant,
             prompt,
@@ -258,11 +298,54 @@ class Router:
                 if ctx.done.is_set() and ctx.out_q.empty():
                     break
                 delta = await ctx.out_q.get()
+                if not delta:
+                    continue
+
+                # CHANGED: first token metrics
+                if not first_seen:
+                    ttft = max(0.0, time.monotonic() - t_submit)
+                    METRIC_TTFT.observe(ttft)                               # existing global TTFT
+                    BACKEND_TTFT.labels(backend=self._backend_label).observe(ttft)  # NEW per-backend TTFT
+                    first_seen = True
+
+                # CHANGED: streaming counters
+                STREAM_EVENTS.labels(backend=self._backend_label).inc()
+                b = len(delta.encode("utf-8", errors="ignore"))
+                total_bytes += b
+                STREAM_BYTES.labels(backend=self._backend_label).inc(b)
+                t_est = _estimate_tokens(delta)
+                total_tokens += t_est
+                STREAM_TOKENS.labels(backend=self._backend_label).inc(t_est)
+                if self._backend_label == "vllm":
+                    VLLM_PD_TOKENS_STREAMED.inc(t_est)
+
                 yield delta
         finally:
-            # drain any remaining chunks
+            # Drain any outstanding chunks (still count metrics)
             while not ctx.out_q.empty():
-                yield await ctx.out_q.get()
+                delta = await ctx.out_q.get()
+                if not delta:
+                    continue
+                if not first_seen:
+                    ttft = max(0.0, time.monotonic() - t_submit)
+                    METRIC_TTFT.observe(ttft)
+                    BACKEND_TTFT.labels(backend=self._backend_label).observe(ttft)
+                    first_seen = True
+
+                STREAM_EVENTS.labels(backend=self._backend_label).inc()
+                b = len(delta.encode("utf-8", errors="ignore"))
+                total_bytes += b
+                STREAM_BYTES.labels(backend=self._backend_label).inc(b)
+                t_est = _estimate_tokens(delta)
+                total_tokens += t_est
+                STREAM_TOKENS.labels(backend=self._backend_label).inc(t_est)
+                if self._backend_label == "vllm":
+                    VLLM_PD_TOKENS_STREAMED.inc(t_est)
+
+            log.debug(
+                "stream finished backend=%s tenant=%s bytes=%d tokens~%d",
+                self._backend_label, tenant, total_bytes, total_tokens
+            )
 
     async def complete(
         self, prompt: str, tenant: str | None = None, opts: dict | None = None
