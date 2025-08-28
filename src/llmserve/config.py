@@ -205,6 +205,22 @@ class RPCCfg(BaseModel):
     round_robin: bool = True  # client-side LB; fine with ClusterIP too
 
 # =========================
+# Disaggregated mode
+# =========================
+
+class DisaggVLLMCfg(BaseModel):
+    # Where our router will forward user requests (vLLM-provided endpoint)
+    # Option A: point to a vLLM "disagg proxy" (recommended when you use their PD orchestration)
+    # Option B: point directly to the vLLM decode server if that server fronts the API for your version.
+    proxy_url: str | None = None      # e.g., "http://vllm-proxy:8000"
+    decode_url: str | None = None     # e.g., "http://vllm-decode:8000"
+    auth_header: str | None = None    # optional bearer
+
+class DisaggCfg(BaseModel):
+    provider: Literal["custom", "vllm"] = "custom"
+    vllm: DisaggVLLMCfg = DisaggVLLMCfg()
+
+# =========================
 # Top-level Spec
 # =========================
 
@@ -241,6 +257,8 @@ class SpecCfg(BaseModel):
 
     roles: RolesCfg = RolesCfg()      # <— NEW
     rpc: RPCCfg = RPCCfg()
+
+    disagg: DisaggCfg = DisaggCfg()
 
     @model_validator(mode="after")
     def _validate_spec(self):

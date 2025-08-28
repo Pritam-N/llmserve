@@ -1,30 +1,39 @@
 apiVersion: v1
 kind: LLMServe
-metadata: {name: dev}
+metadata: { name: dev }
 spec:
+  ###########################################################################
+  # Models
+  ###########################################################################
   models:
     primary:
       id: mistralai/Mistral-7B-Instruct
       dtype: bf16
       max_model_len: 32768
-      tensor_parallel: 2
-      pipeline_parallel: 1
+      tensor_parallel: 2           # default TP when running monolith
+      pipeline_parallel: 1         # default PP when running monolith
+    # (optional) Explicit draft model if you want Router to know about it
+    draft:
+      id: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+      enabled: true
+      speculative_tokens: 8
 
-  # speculative decoding controls
+  ###########################################################################
+  # Decode strategy & speculative controls
+  ###########################################################################
   spec_decode:
     enabled: true
-    method: draft             # draft | eagle | eagle2 | medusa | arctic
+    method: draft                # draft | eagle | eagle2 | medusa | arctic
     num_spec_tokens: 8
-    draft_model: TinyLlama/TinyLlama-1.1B-Chat-v1.0  # required if method=draft
+    draft_model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
 
-  # top-level decode strategy selector
-  decode_strategy: hybrid    # baseline | speculative | lookahead | hybrid
+  decode_strategy: hybrid        # baseline | speculative | lookahead | hybrid
 
   hybrid:
     enabled: true
     min_decode_tokens: 512
-    tenants: []           # allow all
-    prefer_vllm: true
+    tenants: []                  # allow all tenants to use hybrid
+    prefer_vllm: true            # prefer vLLM speculative path where available
     fallback: baseline
 
   lookahead:
@@ -34,27 +43,30 @@ spec:
     plugin: llmserve_ext_lookahead
     fallback: baseline
 
+  ###########################################################################
+  # Scheduling, rate limits, budgets
+  ###########################################################################
   scheduling:
     fair_share:
       tenants:
-        default: {weight: 1.0}
-        premium: {weight: 2.0, ttft_slo_ms: 300}
+        default: { weight: 1.0 }
+        premium: { weight: 2.0, ttft_slo_ms: 300 }
     policies:
       chunked_prefill: true
       prefill_chunk_tokens: 512
       prefill_long_prompt_tokens: 1024
       min_decode_slots: 2
       queue_max_len: 2000
-      prefix_awareness: true
-      aging_seconds: 2.0
+      prefix_awareness: true       # prefix hit-probability in scoring
+      aging_seconds: 2.0           # starvation control
 
   rate_limit:
     default:
-        mode: penalize          # penalize | block | reject
-        tokens_per_sec: 5000
-        burst: 20000
-        max_concurrency: 16
-        penalty_max: 3.0        # up to 3× lower priority when
+      mode: penalize               # penalize | block | reject
+      tokens_per_sec: 5000
+      burst: 20000
+      max_concurrency: 16
+      penalty_max: 3.0             # up to 3× lower priority when throttled
 
   budgets:
     max_tokens_in_flight: 250000
@@ -63,6 +75,9 @@ spec:
     max_kv_hbm_gb: 60
     max_kv_io_gbps: 60
 
+  ###########################################################################
+  # KV cache + storage classes
+  ###########################################################################
   kv_cache:
     page_size_kb: 512
     prefix_caching: true
@@ -87,17 +102,126 @@ spec:
       region: ap-south-1
       prefetch_on_prefix: false
 
+  ###########################################################################
+  # Transfer engines (NIXL → UCX → NCCL → disk handle)
+  ###########################################################################
   transfer:
-    engine_order: [nixl, ucx, nccl]
-    nixl: { backend_policy: auto }
-    ucx:  { rdma: true }
-    nccl: { p2p: true }
+    engine_order: [nixl, ucx, nccl, disk]
+    nixl:
+      backend_policy: auto
+      iface: mlx5_0:1              # pin to IB/RoCE device (optional)
+      qp_depth: 1024
+    ucx:
+      rdma: true
+      tls: [rc_x, ud_x, cuda_copy, cuda_ipc, mm, self]
+      net_devices: mlx5_0:1        # matches network.iface.name by default
+      rndv_scheme: get_zcopy
+      rndv_thresh_bytes: 262144
+      max_rndv_rails: 2
+    nccl:
+      intra_pod: true
+      async_errors: true
+    disk:
+      storage_class: fast-nvme
+      prefetch_on_prefix: true
+      gds: true
+
+  ###########################################################################
+  # Deployment & role sizing (TP×PP per pod, DP via replicas)
+  ###########################################################################
+  roles:
+    prefill: { tp: 2, pp: 1, dp_replicas: 4 }
+    decode:  { tp: 2, pp: 1, dp_replicas: 8 }
 
   deployment:
     mode: k8s
-    replicas: {prefill: 4, decode: 8}
-    resources: {prefill_gpu: 1, decode_gpu: 1}
+    disaggregated: true
+    router_port: 8000
+    prefill_port: 9001
+    decode_port: 9002
+    replicas: { router: 1 }       # router replicas; prefill/decode use roles.*.dp_replicas
+    resources: { prefill_gpu: 1, decode_gpu: 1 }   # legacy hint; roles drive real sizing
 
+  ###########################################################################
+  # Networking (config-driven; optional pieces)
+  ###########################################################################
+  network:
+    service_type: LoadBalancer     # router Service type
+    host_network: false            # set true to run pods on host network
+    priority_class: ""             # K8s PriorityClass if you have one
+
+    # Interface pinning (used for UCX_NET_DEVICES; NCCL_SOCKET_IFNAME falls back to eth0 if value includes ':')
+    iface:
+      name: mlx5_0:1
+
+    # RDMA resource exposure (requires RDMA shared device plugin)
+    rdma:
+      enabled: true
+      resource_name: rdma/hca
+      count: 1
+
+    # Multus/SR-IOV attachments (optional)
+    multus:
+      enabled: true
+      networks:
+        - name: ib-sriov-net
+          namespace: llmserve
+          interface: net1
+      # Optional: auto-create NADs (adjust CNI JSON to your cluster)
+      definitions:
+        - name: ib-sriov-net
+          namespace: llmserve
+          config: |
+            {
+              "cniVersion": "0.3.1",
+              "type": "sriov",
+              "name": "ib-sriov-net",
+              "ipam": { "type": "host-local" }
+            }
+
+    # Spread pods across nodes
+    topology_spread:
+      enabled: true
+      max_skew: 1
+      topology_key: kubernetes.io/hostname
+      when_unsatisfiable: ScheduleAnyway
+
+    # Role-specific placement (optional)
+    node_selector:
+      prefill: { role: prefill }
+      decode:  { role: decode }
+      router:  { role: router }
+
+    # Tolerations (default GPU toleration is added automatically if omitted)
+    tolerations:
+      - { key: "nvidia.com/gpu", operator: "Exists", effect: "NoSchedule" }
+
+    # Extra env per role (merged with UCX/NCCL defaults)
+    extra_env:
+      prefill:
+        - { name: UCX_RNDV_SCHEME, value: get_zcopy }
+        - { name: UCX_RNDV_THRESH, value: "262144" }
+      decode:
+        - { name: UCX_RNDV_SCHEME, value: get_zcopy }
+        - { name: UCX_RNDV_THRESH, value: "262144" }
+
+    # Extra annotations per role (optional)
+    annotations:
+      prefill: { iam/role: kv-prefill }
+      decode:  { iam/role: kv-decode }
+
+  ###########################################################################
+  # Security
+  ###########################################################################
   security:
     api_keys: ["env:API_KEY"]
 
+  ###########################################################################
+  # Disaggregation provider (vLLM PD or our custom gRPC PD)
+  ###########################################################################
+  disagg:
+    provider: vllm
+    vllm:
+      proxy_url:  http://vllm-proxy:8008     # matches our k8s template (change if you expose on 8000)
+      decode_url: http://vllm-decode:8000
+      auth_header: "Bearer ${API_KEY}"
